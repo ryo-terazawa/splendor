@@ -1,0 +1,4 @@
+# Requirements for Splendor Game Simulator
+
+# No external dependencies required for current code
+# If you add libraries, list them here
