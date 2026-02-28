@@ -1,5 +1,6 @@
 from module import GameState
 import random
+from mcts import SplendorNet, self_play_train
 
 def random_agent(state):
     actions = state.get_legal_actions()
@@ -30,5 +31,8 @@ def play_game():
     winner = max(range(len(state.players)), key=lambda i: state.players[i].points)
     print(f"Winner: Player {winner}")
 
+
 if __name__ == "__main__":
-    play_game()
+    # play_game()
+    model = SplendorNet()
+    self_play_train(model, num_games=10, num_simulations=50, epochs=5, batch_size=32, lr=1e-3, device="cpu")
