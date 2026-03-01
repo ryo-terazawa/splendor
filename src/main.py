@@ -1,6 +1,8 @@
 from module import GameState
 import random
-from mcts import SplendorNet, self_play_train
+from mcts import SplendorNet, self_play_train, StrongSplendorNet
+
+import torch
 
 def random_agent(state):
     actions = state.get_legal_actions()
@@ -34,5 +36,6 @@ def play_game():
 
 if __name__ == "__main__":
     # play_game()
-    model = SplendorNet()
-    self_play_train(model, num_games=10, num_simulations=50, epochs=5, batch_size=32, lr=1e-3, device="cpu")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = StrongSplendorNet().to(device)
+    self_play_train(model, num_games=10, num_simulations=50, epochs=5, batch_size=32, lr=1e-3, device=device)

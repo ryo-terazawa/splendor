@@ -6,7 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from module import action_to_id, state_to_vector, ACTION_SIZE, STATE_SIZE, GameState
 
-
 class DummyDataset(torch.utils.data.Dataset):
     """
     ダミーデータセット。実際のデータで置き換えてください。
@@ -39,27 +38,42 @@ def train(model, dataset, epochs=10, batch_size=32, lr=1e-3, device="cpu"):
     dataset: (state, policy, value)のタプルを返すDataset
     """
     model = model.to(device)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # DataLoaderのワーカ数を増やす（CPUコア数に応じて調整）
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=(device=="cuda"))
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn_policy = nn.KLDivLoss(reduction="batchmean")
     loss_fn_value = nn.MSELoss()
+    scaler = torch.cuda.amp.GradScaler() if device=="cuda" else None
 
     for epoch in range(epochs):
         model.train()
         total_loss = 0
-        for state, target_policy, target_value in dataloader:
-            state = state.to(device)
-            target_policy = target_policy.to(device)
-            target_value = target_value.to(device)
+        for i, (state, target_policy, target_value) in enumerate(dataloader):
+            state = state.to(device, non_blocking=True)
+            target_policy = target_policy.to(device, non_blocking=True)
+            target_value = target_value.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            pred_policy, pred_value = model(state)
-            loss_policy = loss_fn_policy(pred_policy.log(), target_policy)
-            loss_value = loss_fn_value(pred_value, target_value)
-            loss = loss_policy + loss_value
-            loss.backward()
-            optimizer.step()
+            if device=="cuda":
+                with torch.cuda.amp.autocast():
+                    pred_policy, pred_value = model(state)
+                    loss_policy = loss_fn_policy(pred_policy.log(), target_policy)
+                    loss_value = loss_fn_value(pred_value, target_value)
+                    loss = loss_policy + loss_value
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                pred_policy, pred_value = model(state)
+                loss_policy = loss_fn_policy(pred_policy.log(), target_policy)
+                loss_value = loss_fn_value(pred_value, target_value)
+                loss = loss_policy + loss_value
+                loss.backward()
+                optimizer.step()
             total_loss += loss.item()
+            # 100バッチごとに進捗表示
+            if (i+1) % 100 == 0:
+                print(f"  Batch {i+1}: Loss={loss.item():.4f}")
         print(f"Epoch {epoch+1}/{epochs} Loss: {total_loss/len(dataloader):.4f}")
 
 
@@ -93,7 +107,8 @@ def mcts_with_nn(state, model, num_simulations=100):
 
     root = Node(state)
     # ルートでNN推論
-    state_vec = torch.tensor(state_to_vector(state), dtype=torch.float32).unsqueeze(0)
+    device = next(model.parameters()).device
+    state_vec = state_to_vector(state).unsqueeze(0).to(device)
     with torch.no_grad():
         policy_logits, value = model(state_vec)
         policy = policy_logits.squeeze(0).cpu().numpy()
@@ -137,7 +152,8 @@ def mcts_with_nn(state, model, num_simulations=100):
                     next_state.step(a)
                     child = Node(next_state, parent=node)
                     # NN推論
-                    state_vec = torch.tensor(state_to_vector(next_state), dtype=torch.float32).unsqueeze(0)
+                    device = next(model.parameters()).device
+                    state_vec = torch.tensor(state_to_vector(next_state), dtype=torch.float32).unsqueeze(0).to(device)
                     with torch.no_grad():
                         p_logits, v = model(state_vec)
                         p = p_logits.squeeze(0).cpu().numpy()
@@ -201,7 +217,7 @@ def self_play_train(model, num_games=10, num_simulations=50, epochs=5, batch_siz
             else:
                 filtered_policy = [1/len(legal_actions) if a in legal_actions else 0 for a in range(ACTION_SIZE)]
             # 状態・ポリシー記録
-            states.append(torch.tensor(state_to_vector(state), dtype=torch.float32))
+            states.append(state_to_vector(state).clone())
             policies.append(torch.tensor(filtered_policy, dtype=torch.float32))
             history.append((state.current_player, len(states)-1))
             state.step(action)
@@ -223,4 +239,47 @@ def self_play_train(model, num_games=10, num_simulations=50, epochs=5, batch_siz
     train(model, dataset, epochs=epochs, batch_size=batch_size, lr=lr, device=device)
     now = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_model(model, f"self_play_model_{now}.pth")
+
+class ResidualBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim)
+        self.fc2 = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        identity = x
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return F.relu(x + identity)
+
+
+class StrongSplendorNet(nn.Module):
+    def __init__(self, hidden_dim=256, num_blocks=4):
+        super().__init__()
+
+        self.input_layer = nn.Linear(STATE_SIZE, hidden_dim)
+
+        self.res_blocks = nn.ModuleList(
+            [ResidualBlock(hidden_dim) for _ in range(num_blocks)]
+        )
+
+        # policy head
+        self.policy_fc = nn.Linear(hidden_dim, ACTION_SIZE)
+
+        # value head
+        self.value_fc1 = nn.Linear(hidden_dim, 128)
+        self.value_fc2 = nn.Linear(128, 1)
+
+    def forward(self, x):
+        x = F.relu(self.input_layer(x))
+
+        for block in self.res_blocks:
+            x = block(x)
+
+        policy = F.softmax(self.policy_fc(x), dim=-1)
+
+        v = F.relu(self.value_fc1(x))
+        value = torch.tanh(self.value_fc2(v))
+
+        return policy, value
     

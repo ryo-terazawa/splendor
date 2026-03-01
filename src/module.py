@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 ACTION_SIZE = 43
 STATE_SIZE = 102  # 実際の次元に合わせる
 
@@ -77,7 +78,19 @@ class Player:
 class GameState:
 
     def copy(self):
-        return copy.deepcopy(self)
+        # GameStateのカスタムコピー（deepcopyより高速）
+        new_state = GameState(self.num_players)
+        # プレイヤー情報
+        new_state.players = [Player(tokens=p.tokens.copy(), bonuses=p.bonuses.copy(), points=p.points, reserved=list(p.reserved)) for p in self.players]
+        new_state.current_player = self.current_player
+        new_state.bank = self.bank.copy()
+        # デッキ・テーブル
+        new_state.decks = {lv: list(cards) for lv, cards in self.decks.items()}
+        new_state.table = [[card for card in row] for row in self.table]
+        # 貴族
+        new_state.nobility = list(self.nobility)
+        new_state.game_over = self.game_over
+        return new_state
 
     def __init__(self, num_players=4):
         self.num_players = num_players
