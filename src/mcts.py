@@ -41,13 +41,15 @@ def train(model, dataset, epochs=10, batch_size=32, lr=1e-3, device="cpu"):
     # DataLoaderのワーカ数を増やす（CPUコア数に応じて調整）
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=(device=="cuda"))
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn_policy = nn.KLDivLoss(reduction="batchmean")
+    loss_fn_policy = nn.CrossEntropyLoss()
     loss_fn_value = nn.MSELoss()
     scaler = torch.cuda.amp.GradScaler() if device=="cuda" else None
 
     for epoch in range(epochs):
         model.train()
         total_loss = 0
+        total_policy_loss = 0
+        total_value_loss = 0
         for i, (state, target_policy, target_value) in enumerate(dataloader):
             state = state.to(device, non_blocking=True)
             target_policy = target_policy.to(device, non_blocking=True)
@@ -56,25 +58,30 @@ def train(model, dataset, epochs=10, batch_size=32, lr=1e-3, device="cpu"):
             optimizer.zero_grad()
             if device=="cuda":
                 with torch.cuda.amp.autocast():
-                    pred_policy, pred_value = model(state)
-                    loss_policy = loss_fn_policy(pred_policy.log(), target_policy)
+                    pred_policy_logits, pred_value = model(state)
+                    loss_policy = loss_fn_policy(pred_policy_logits, target_policy.argmax(dim=1))
                     loss_value = loss_fn_value(pred_value, target_value)
                     loss = loss_policy + loss_value
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                pred_policy, pred_value = model(state)
-                loss_policy = loss_fn_policy(pred_policy.log(), target_policy)
+                pred_policy_logits, pred_value = model(state)
+                loss_policy = loss_fn_policy(pred_policy_logits, target_policy.argmax(dim=1))
                 loss_value = loss_fn_value(pred_value, target_value)
                 loss = loss_policy + loss_value
                 loss.backward()
                 optimizer.step()
             total_loss += loss.item()
+            total_policy_loss += loss_policy.item()
+            total_value_loss += loss_value.item()
             # 100バッチごとに進捗表示
             if (i+1) % 100 == 0:
                 print(f"  Batch {i+1}: Loss={loss.item():.4f}")
         print(f"Epoch {epoch+1}/{epochs} Loss: {total_loss/len(dataloader):.4f}")
+        print(f"  Total Loss: {total_loss/len(dataloader):.4f}")
+        print(f"  Policy Loss: {total_policy_loss/len(dataloader):.4f}")
+        print(f"  Value  Loss: {total_value_loss/len(dataloader):.4f}")
 
 
 class SplendorNet(nn.Module):
@@ -91,108 +98,162 @@ class SplendorNet(nn.Module):
         policy = F.softmax(self.policy_head(x), dim=-1)
         value = torch.tanh(self.value_head(x))
         return policy, value
-    
-    
-def mcts_with_nn(state, model, num_simulations=100):
-    # MCTSとNN推論の連携
+
+
+def mcts_with_nn(state, model, num_simulations=100,
+                 c_puct=1.5,
+                 dirichlet_alpha=0.3,
+                 dirichlet_eps=0.25,
+                 temperature=1.0,
+                 move_count=0):
+
+    device = next(model.parameters()).device
+
     class Node:
         def __init__(self, state, parent=None):
             self.state = state
             self.parent = parent
-            self.children = {}
-            self.N = 0  # 訪問回数
-            self.W = 0  # 累積価値
-            self.P = None  # NNポリシー
-            self.V = None  # NNバリュー
+            self.children = {}          # action -> Node
+            self.N = 0                  # visit count
+            self.W = 0.0                # total value
+            self.P = None               # policy prior
+            self.expanded = False       # NN evaluated?
+
+        def Q(self):
+            return self.W / (self.N + 1e-8)
 
     root = Node(state)
-    # ルートでNN推論
-    device = next(model.parameters()).device
-    state_vec = state_to_vector(state).unsqueeze(0).to(device)
-    with torch.no_grad():
-        policy_logits, value = model(state_vec)
+
+    # -----------------------------
+    # NN評価（初回）
+    # -----------------------------
+    def evaluate(node, add_noise=False):
+        state_vec = state_to_vector(node.state).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            policy_logits, value = model(state_vec)
+
         policy = policy_logits.squeeze(0).cpu().numpy()
         value = value.item()
-    legal_actions = state.get_legal_actions()
-    mask = [1 if a in legal_actions else 0 for a in range(ACTION_SIZE)]
-    policy = policy * mask
-    if policy.sum() > 0:
-        policy = policy / policy.sum()
-    else:
-        policy = [1/len(legal_actions) if a in legal_actions else 0 for a in range(ACTION_SIZE)]
-    root.P = policy
-    root.V = value
 
-    c_puct = 1.0
+        legal_actions = node.state.get_legal_actions()
+        mask = np.zeros(ACTION_SIZE, dtype=np.float32)
 
+        for a in legal_actions:
+            a_id = action_to_id(a)
+            mask[a_id] = 1.0
+
+        policy = policy * mask
+
+        if policy.sum() > 0:
+            policy /= policy.sum()
+        else:
+            policy = mask / mask.sum()
+
+        # Dirichlet Noise（rootのみ）
+        if add_noise:
+            noise = np.random.dirichlet([dirichlet_alpha] * len(legal_actions))
+            noise_masked = np.zeros(ACTION_SIZE)
+            for i, a in enumerate(legal_actions):
+                noise_masked[action_to_id(a)] = noise[i]
+            policy = (1 - dirichlet_eps) * policy + dirichlet_eps * noise_masked
+
+        node.P = policy
+        node.expanded = True
+
+        return value
+
+    # rootは必ず評価
+    evaluate(root, add_noise=True)
+
+    # =============================
+    # MCTSループ
+    # =============================
     for _ in range(num_simulations):
+
         node = root
         path = [node]
-        # 選択
-        while node.children:
+
+        # ---- Selection ----
+        while node.expanded and node.children:
+            best_score = -float("inf")
+            best_action = None
             total_N = sum(child.N for child in node.children.values())
-            best_score = -float('inf')
-            best_a = None
-            for a, child in node.children.items():
-                a_id = action_to_id(a)
-                u = c_puct * node.P[a_id] * math.sqrt(total_N+1) / (1 + child.N)
-                q = child.W / (child.N+1e-8)
-                score = q + u
+
+            for action, child in node.children.items():
+                a_id = action_to_id(action)
+
+                U = c_puct * node.P[a_id] * math.sqrt(total_N + 1) / (1 + child.N)
+                Q = child.Q()
+
+                score = Q + U
+
                 if score > best_score:
                     best_score = score
-                    best_a = a
-            node = node.children[best_a]
+                    best_action = action
+
+            node = node.children[best_action]
             path.append(node)
-        # 展開
-        if not node.state.game_over:
-            legal_actions = node.state.get_legal_actions()
-            for a in legal_actions:
-                if a not in node.children:
-                    next_state = node.state.copy()
-                    next_state.step(a)
-                    child = Node(next_state, parent=node)
-                    # NN推論
-                    device = next(model.parameters()).device
-                    state_vec = torch.tensor(state_to_vector(next_state), dtype=torch.float32).unsqueeze(0).to(device)
-                    with torch.no_grad():
-                        p_logits, v = model(state_vec)
-                        p = p_logits.squeeze(0).cpu().numpy()
-                        v = v.item()
-                    mask = [1 if aa in next_state.get_legal_actions() else 0 for aa in range(ACTION_SIZE)]
-                    p = p * mask
-                    if p.sum() > 0:
-                        p = p / p.sum()
-                    else:
-                        p = [1/len(mask) if m else 0 for m in mask]
-                    child.P = p
-                    child.V = v
-                    node.children[a] = child
-            # 1つだけ子ノードを選んで評価値をバックプロパゲーション
-            if node.children:
-                a = legal_actions[0]
-                v = node.children[a].V
-            else:
-                v = 0
+
+        # ---- Expansion ----
+        if not node.expanded:
+            v = evaluate(node)
         else:
-            v = 0
-        # バックプロパゲーション
+            # まだ子が作られていない場合
+            legal_actions = node.state.get_legal_actions()
+
+            if legal_actions:
+                action = legal_actions[0]
+                next_state = node.state.copy()
+                next_state.step(action)
+                child = Node(next_state, parent=node)
+                node.children[action] = child
+                node = child
+                path.append(node)
+                v = evaluate(node)
+            else:
+                v = 0.0
+
+        # ---- Backprop ----
         for n in reversed(path):
             n.N += 1
-            n.W += v
+            n.W += v  # 多人数対応（符号反転なし）
 
-    # 最も訪問回数の多い手を選択
-    visits = [root.children[a].N if a in root.children else 0 for a in range(ACTION_SIZE)]
-    if sum(visits) > 0:
-        best_action = int(np.argmax(visits))
-        policy = np.array(visits, dtype=np.float32)
-        policy = policy / policy.sum()
-    else:
+    # =============================
+    # 行動選択
+    # =============================
+    visits = np.zeros(ACTION_SIZE, dtype=np.float32)
+
+    for action, child in root.children.items():
+        a_id = action_to_id(action)
+        visits[a_id] = child.N
+
+    if visits.sum() == 0:
         legal_actions = state.get_legal_actions()
-        best_action = legal_actions[0] if legal_actions else None
-        policy = np.array([1/len(legal_actions) if a in legal_actions else 0 for a in range(ACTION_SIZE)], dtype=np.float32)
-    return best_action, policy.tolist()
+        action = legal_actions[0] if legal_actions else None
+        policy = visits
+        return action, policy.tolist()
 
-def self_play_train(model, num_games=10, num_simulations=50, epochs=5, batch_size=32, lr=1e-3, device="cpu"):
+    # Temperature制御
+    if temperature > 0 and move_count < 20:
+        visits = visits ** (1.0 / temperature)
+        visits /= visits.sum()
+        action_id = np.random.choice(range(ACTION_SIZE), p=visits)
+    else:
+        action_id = np.argmax(visits)
+        visits /= visits.sum()
+
+    # id -> action変換
+    legal_actions = state.get_legal_actions()
+    selected_action = None
+
+    for a in legal_actions:
+        if action_to_id(a) == action_id:
+            selected_action = a
+            break
+
+    return selected_action, visits.tolist()
+def self_play_train(model, num_games=200, num_simulations=100, epochs=10, batch_size=256, lr=1e-3, device="cpu"):
     """
     MCTS同士で自己対戦し、合法手のみでデータを収集し学習する関数。
     非合法手はpass扱い。
@@ -226,7 +287,7 @@ def self_play_train(model, num_games=10, num_simulations=50, epochs=5, batch_siz
         # 各手番に勝敗ラベル付与
         for player, idx in history:
             values.append(torch.tensor([1.0 if player == winner else -1.0], dtype=torch.float32))
-        print(f"Game {game+1}/{num_games} 終了 勝者: Player {winner}")
+        print(f"Game {game+1}/{num_games} 終了 勝者: Player {winner} ターン数: {len(history)}")
 
     # データセット作成
     class SelfPlayDataset(torch.utils.data.Dataset):
@@ -276,10 +337,10 @@ class StrongSplendorNet(nn.Module):
         for block in self.res_blocks:
             x = block(x)
 
-        policy = F.softmax(self.policy_fc(x), dim=-1)
+        policy_logits = self.policy_fc(x)
 
         v = F.relu(self.value_fc1(x))
         value = torch.tanh(self.value_fc2(v))
 
-        return policy, value
+        return policy_logits, value
     

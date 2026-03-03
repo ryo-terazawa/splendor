@@ -338,22 +338,32 @@ def action_to_id(action):
 def state_to_vector(state):
     vec = []
 
-    # bank
+    # ---- bank ----
     vec += list(state.bank.values())
 
-    for p in state.players:
+    current = state.current_player
+    num_players = len(state.players)
+
+    # ---- プレイヤー情報をcurrent基準に並び替え ----
+    ordered_players = []
+
+    for i in range(num_players):
+        idx = (current + i) % num_players
+        ordered_players.append(state.players[idx])
+
+    for p in ordered_players:
         vec += list(p.tokens.values())
         vec += list(p.bonuses.values())
         vec.append(p.points)
 
-    # table cards
+    # ---- table ----
     for lv in range(3):
         for card in state.table[lv]:
             if card is not None:
                 vec += list(card.cost.values())
                 vec.append(card.points)
             else:
-                vec += [0]*5  # cost部分
-                vec.append(0) # points部分
+                vec += [0]*5
+                vec.append(0)
 
     return torch.tensor(vec, dtype=torch.float32)
