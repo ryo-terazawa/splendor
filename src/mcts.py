@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from module import action_to_id, state_to_vector, ACTION_SIZE, STATE_SIZE, GameState
+import os
+from glob import glob
 
 class DummyDataset(torch.utils.data.Dataset):
     """
@@ -41,7 +43,6 @@ def train(model, dataset, epochs=10, batch_size=32, lr=1e-3, device="cpu"):
     # DataLoaderのワーカ数を増やす（CPUコア数に応じて調整）
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=(device=="cuda"))
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn_policy = nn.CrossEntropyLoss()
     loss_fn_value = nn.MSELoss()
     scaler = torch.cuda.amp.GradScaler() if device=="cuda" else None
 
@@ -59,7 +60,11 @@ def train(model, dataset, epochs=10, batch_size=32, lr=1e-3, device="cpu"):
             if device=="cuda":
                 with torch.cuda.amp.autocast():
                     pred_policy_logits, pred_value = model(state)
-                    loss_policy = loss_fn_policy(pred_policy_logits, target_policy.argmax(dim=1))
+                    log_probs = torch.log_softmax(pred_policy_logits, dim=1)
+                    loss_policy = -torch.sum(
+                        target_policy * log_probs,
+                        dim=1
+                    ).mean()
                     loss_value = loss_fn_value(pred_value, target_value)
                     loss = loss_policy + loss_value
                 scaler.scale(loss).backward()
@@ -67,7 +72,20 @@ def train(model, dataset, epochs=10, batch_size=32, lr=1e-3, device="cpu"):
                 scaler.update()
             else:
                 pred_policy_logits, pred_value = model(state)
-                loss_policy = loss_fn_policy(pred_policy_logits, target_policy.argmax(dim=1))
+                log_probs = torch.log_softmax(pred_policy_logits, dim=1)
+                # print("\n[Debug] Batch data:")
+                # print("target_policy shape:", target_policy.shape)
+                # print("target_policy mean:", target_policy.mean().item())
+                # print("target_policy max :", target_policy.max().item())
+                # print("target_policy min :", target_policy.min().item())
+                # print("log_probs shape:", log_probs.shape)
+                # print("log_probs mean:", log_probs.mean().item())
+                # print("log_probs max :", log_probs.max().item())
+                # print("log_probs min :", log_probs.min().item())
+                loss_policy = -torch.sum(
+                    target_policy * log_probs,
+                    dim=1
+                ).mean()
                 loss_value = loss_fn_value(pred_value, target_value)
                 loss = loss_policy + loss_value
                 loss.backward()
@@ -84,28 +102,16 @@ def train(model, dataset, epochs=10, batch_size=32, lr=1e-3, device="cpu"):
         print(f"  Value  Loss: {total_value_loss/len(dataloader):.4f}")
 
 
-class SplendorNet(nn.Module):
-    def __init__(self):
-        super(SplendorNet, self).__init__()
-        self.fc1 = nn.Linear(STATE_SIZE, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.policy_head = nn.Linear(128, ACTION_SIZE)
-        self.value_head = nn.Linear(128, 1)
-
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        policy = F.softmax(self.policy_head(x), dim=-1)
-        value = torch.tanh(self.value_head(x))
-        return policy, value
-
-
-def mcts_with_nn(state, model, num_simulations=100,
-                 c_puct=1.5,
-                 dirichlet_alpha=0.3,
-                 dirichlet_eps=0.25,
-                 temperature=1.0,
-                 move_count=0):
+def mcts_with_nn(
+    state,
+    model,
+    num_simulations=50,
+    c_puct=1.5,
+    dirichlet_alpha=0.3,
+    dirichlet_eps=0.25,
+    temperature=1.0,
+    move_count=0,
+):
 
     device = next(model.parameters()).device
 
@@ -113,19 +119,17 @@ def mcts_with_nn(state, model, num_simulations=100,
         def __init__(self, state, parent=None):
             self.state = state
             self.parent = parent
-            self.children = {}          # action -> Node
-            self.N = 0                  # visit count
-            self.W = 0.0                # total value
-            self.P = None               # policy prior
-            self.expanded = False       # NN evaluated?
+            self.children = {}   # action -> Node
+            self.N = 0
+            self.W = 0.0
+            self.P = None       # prior probability
+            self.expanded = False
 
         def Q(self):
             return self.W / (self.N + 1e-8)
 
-    root = Node(state)
-
     # -----------------------------
-    # NN評価（初回）
+    # NN評価
     # -----------------------------
     def evaluate(node, add_noise=False):
         state_vec = state_to_vector(node.state).unsqueeze(0).to(device)
@@ -133,15 +137,14 @@ def mcts_with_nn(state, model, num_simulations=100,
         with torch.no_grad():
             policy_logits, value = model(state_vec)
 
-        policy = policy_logits.squeeze(0).cpu().numpy()
+        policy = torch.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
         value = value.item()
 
         legal_actions = node.state.get_legal_actions()
         mask = np.zeros(ACTION_SIZE, dtype=np.float32)
 
         for a in legal_actions:
-            a_id = action_to_id(a)
-            mask[a_id] = 1.0
+            mask[action_to_id(a)] = 1.0
 
         policy = policy * mask
 
@@ -150,7 +153,7 @@ def mcts_with_nn(state, model, num_simulations=100,
         else:
             policy = mask / mask.sum()
 
-        # Dirichlet Noise（rootのみ）
+        # Rootのみノイズ
         if add_noise:
             noise = np.random.dirichlet([dirichlet_alpha] * len(legal_actions))
             noise_masked = np.zeros(ACTION_SIZE)
@@ -161,31 +164,39 @@ def mcts_with_nn(state, model, num_simulations=100,
         node.P = policy
         node.expanded = True
 
+        # 全合法手を展開する
+        for action in legal_actions:
+            next_state = node.state.copy()
+            next_state.step(action)
+            node.children[action] = Node(next_state, parent=node)
+
         return value
 
-    # rootは必ず評価
+    # -----------------------------
+    # Root作成
+    # -----------------------------
+    root = Node(state)
     evaluate(root, add_noise=True)
 
-    # =============================
+    # -----------------------------
     # MCTSループ
-    # =============================
+    # -----------------------------
     for _ in range(num_simulations):
 
         node = root
         path = [node]
 
         # ---- Selection ----
-        while node.expanded and node.children:
+        while node.children:
+            total_N = sum(child.N for child in node.children.values())
             best_score = -float("inf")
             best_action = None
-            total_N = sum(child.N for child in node.children.values())
 
             for action, child in node.children.items():
                 a_id = action_to_id(action)
 
-                U = c_puct * node.P[a_id] * math.sqrt(total_N + 1) / (1 + child.N)
+                U = (c_puct * node.P[a_id] * math.sqrt(total_N + 1) / (1 + child.N))
                 Q = child.Q()
-
                 score = Q + U
 
                 if score > best_score:
@@ -195,46 +206,35 @@ def mcts_with_nn(state, model, num_simulations=100,
             node = node.children[best_action]
             path.append(node)
 
-        # ---- Expansion ----
+            if not node.expanded:
+                break
+
+        # ---- Expansion + Evaluation ----
         if not node.expanded:
             v = evaluate(node)
         else:
-            # まだ子が作られていない場合
-            legal_actions = node.state.get_legal_actions()
-
-            if legal_actions:
-                action = legal_actions[0]
-                next_state = node.state.copy()
-                next_state.step(action)
-                child = Node(next_state, parent=node)
-                node.children[action] = child
-                node = child
-                path.append(node)
-                v = evaluate(node)
-            else:
-                v = 0.0
+            # terminal node
+            v = 0.0
 
         # ---- Backprop ----
         for n in reversed(path):
             n.N += 1
-            n.W += v  # 多人数対応（符号反転なし）
+            n.W += v   # 多人数対応（符号反転なし）
 
-    # =============================
+    # -----------------------------
     # 行動選択
-    # =============================
+    # -----------------------------
     visits = np.zeros(ACTION_SIZE, dtype=np.float32)
 
     for action, child in root.children.items():
-        a_id = action_to_id(action)
-        visits[a_id] = child.N
+        visits[action_to_id(action)] = child.N
 
     if visits.sum() == 0:
         legal_actions = state.get_legal_actions()
         action = legal_actions[0] if legal_actions else None
-        policy = visits
-        return action, policy.tolist()
+        return action, visits.tolist()
 
-    # Temperature制御
+    # ---- Temperature制御 ----
     if temperature > 0 and move_count < 20:
         visits = visits ** (1.0 / temperature)
         visits /= visits.sum()
@@ -243,16 +243,17 @@ def mcts_with_nn(state, model, num_simulations=100,
         action_id = np.argmax(visits)
         visits /= visits.sum()
 
-    # id -> action変換
-    legal_actions = state.get_legal_actions()
+    # id -> action
     selected_action = None
-
-    for a in legal_actions:
+    for a in state.get_legal_actions():
         if action_to_id(a) == action_id:
             selected_action = a
             break
+    
+    # print("visit sum:" + str(visits.sum()) + " visit max:" + str(np.max(visits)))
 
     return selected_action, visits.tolist()
+
 def self_play_train(model, num_games=200, num_simulations=100, epochs=10, batch_size=256, lr=1e-3, device="cpu"):
     """
     MCTS同士で自己対戦し、合法手のみでデータを収集し学習する関数。
@@ -266,21 +267,31 @@ def self_play_train(model, num_games=200, num_simulations=100, epochs=10, batch_
     for game in range(num_games):
         state = GameState(num_players=2)
         history = []
+        move_count = 0
         while not state.game_over and len(history) < 1000:  # ターン数制限を追加
             # MCTSで合法手のみ選択
-            action, policy = mcts_with_nn(state, model, num_simulations)
+            action, policy = mcts_with_nn(state, model, num_simulations, move_count=move_count)
             legal_actions = state.get_legal_actions()
             # 非合法手はpass扱い
-            filtered_policy = [p if a in legal_actions else 0 for a, p in enumerate(policy)]
+            legal_ids = [action_to_id(a) for a in legal_actions]
+
+            filtered_policy = [
+                policy[i] if i in legal_ids else 0.0
+                for i in range(ACTION_SIZE)
+            ]
             s = sum(filtered_policy)
             if s > 0:
                 filtered_policy = [p/s for p in filtered_policy]
             else:
-                filtered_policy = [1/len(legal_actions) if a in legal_actions else 0 for a in range(ACTION_SIZE)]
+                filtered_policy = [
+                    1.0 / len(legal_ids) if i in legal_ids else 0.0
+                    for i in range(ACTION_SIZE)
+                ]
             # 状態・ポリシー記録
             states.append(state_to_vector(state).clone())
             policies.append(torch.tensor(filtered_policy, dtype=torch.float32))
             history.append((state.current_player, len(states)-1))
+            move_count += 1
             state.step(action)
         # 勝者決定
         winner = max(range(len(state.players)), key=lambda i: state.players[i].points)
@@ -343,4 +354,164 @@ class StrongSplendorNet(nn.Module):
         value = torch.tanh(self.value_fc2(v))
 
         return policy_logits, value
-    
+
+def generate_self_play_data(
+    model,
+    num_games=200,
+    num_simulations=50,
+    device="cpu",
+    save_path=None,
+):
+
+    model = model.to(device)
+    model.eval()
+
+    states = []
+    policies = []
+    values = []
+
+    for game in range(num_games):
+
+        state = GameState(num_players=2)
+        history = []
+        move_count = 0
+
+        while not state.game_over and move_count < 200:
+
+            action, policy = mcts_with_nn(
+                state,
+                model,
+                num_simulations=num_simulations,
+                move_count=move_count,
+            )
+
+            legal_actions = state.get_legal_actions()
+
+            legal_ids = [action_to_id(a) for a in legal_actions]
+
+            filtered_policy = [
+                policy[i] if i in legal_ids else 0.0
+                for i in range(ACTION_SIZE)
+            ]
+
+            s = sum(filtered_policy)
+            if s > 0:
+                filtered_policy = [p / s for p in filtered_policy]
+            else:
+                filtered_policy = [
+                    1.0 / len(legal_ids) if i in legal_ids else 0.0
+                    for i in range(ACTION_SIZE)
+                ]
+
+            states.append(state_to_vector(state).clone())
+            policies.append(torch.tensor(filtered_policy, dtype=torch.float32))
+
+            history.append((state.current_player, len(states) - 1))
+
+            state.step(action)
+            move_count += 1
+
+        winner = max(
+            range(len(state.players)),
+            key=lambda i: state.players[i].points,
+        )
+
+        for player, idx in history:
+            values.append(
+                torch.tensor(
+                    [1.0 if player == winner else -1.0],
+                    dtype=torch.float32,
+                )
+            )
+
+        print(f"Game {game+1}/{num_games} 終了 勝者: Player {winner}")
+
+    data = {
+        "states": torch.stack(states),
+        "policies": torch.stack(policies),
+        "values": torch.stack(values),
+    }
+
+    if save_path is None:
+        now = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_path = f"selfplay_data_{now}.pt"
+
+    torch.save(data, save_path)
+
+    print(f"\nデータ保存完了: {save_path}")
+    print(f"総サンプル数: {len(states)}")
+
+    return save_path
+
+def train_from_files(
+    model,
+    data_paths=None,
+    data_dir=None,
+    epochs=10,
+    batch_size=256,
+    lr=1e-3,
+    device="cpu",
+    max_samples=None,   # 古いデータ切り捨て用
+):
+    """
+    複数の自己対戦データをまとめて学習する。
+    data_paths: 明示的なファイルリスト
+    data_dir: ディレクトリ指定（*.ptを全部読む）
+    max_samples: 最新Nサンプルのみ使う（replay buffer化）
+    """
+
+    if data_dir is not None:
+        data_paths = sorted(glob(os.path.join(data_dir, "*.pt")))
+
+    if not data_paths:
+        raise ValueError("データファイルが見つかりません")
+
+    print("ロード対象ファイル:")
+    for p in data_paths:
+        print("  ", p)
+
+    all_states = []
+    all_policies = []
+    all_values = []
+
+    for path in data_paths:
+        data = torch.load(path)
+        all_states.append(data["states"])
+        all_policies.append(data["policies"])
+        all_values.append(data["values"])
+
+    states = torch.cat(all_states, dim=0)
+    policies = torch.cat(all_policies, dim=0)
+    values = torch.cat(all_values, dim=0)
+
+    print(f"\n総サンプル数: {len(states)}")
+
+    # Replay Buffer制御（古いデータ削減）
+    if max_samples is not None and len(states) > max_samples:
+        print(f"最新 {max_samples} サンプルのみ使用")
+        states = states[-max_samples:]
+        policies = policies[-max_samples:]
+        values = values[-max_samples:]
+
+    class SelfPlayDataset(torch.utils.data.Dataset):
+        def __len__(self):
+            return len(states)
+
+        def __getitem__(self, idx):
+            return states[idx], policies[idx], values[idx]
+
+    dataset = SelfPlayDataset()
+
+    train(
+        model,
+        dataset,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        device=device,
+    )
+
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_model(model, f"trained_model_{now}.pth")
+
+    print("学習完了")
