@@ -4,6 +4,14 @@ from dataclasses import dataclass, field
 import csv
 from itertools import combinations
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+ACTION_SIZE = 43
+STATE_SIZE = 102  # 実際の次元に合わせる
+
 COLORS = ["white", "blue", "green", "red", "black"]
 GOLD = "gold"
 SETTING_MAP = {
@@ -68,6 +76,21 @@ class Player:
 # GameState
 # =========================
 class GameState:
+
+    def copy(self):
+        # GameStateのカスタムコピー（deepcopyより高速）
+        new_state = GameState(self.num_players)
+        # プレイヤー情報
+        new_state.players = [Player(tokens=p.tokens.copy(), bonuses=p.bonuses.copy(), points=p.points, reserved=list(p.reserved)) for p in self.players]
+        new_state.current_player = self.current_player
+        new_state.bank = self.bank.copy()
+        # デッキ・テーブル
+        new_state.decks = {lv: list(cards) for lv, cards in self.decks.items()}
+        new_state.table = [[card for card in row] for row in self.table]
+        # 貴族
+        new_state.nobility = list(self.nobility)
+        new_state.game_over = self.game_over
+        return new_state
 
     def __init__(self, num_players=4):
         self.num_players = num_players
@@ -170,8 +193,9 @@ class GameState:
         # ④ 予約（最大3枚）
         for lv in range(3):
             if len(player.reserved) < 3:
-                for i in range(len(self.table[lv])):
-                    actions.append((f"reserve{lv+1}", i))
+                for i, card in enumerate(self.table[lv]):
+                    if card is not None:
+                        actions.append((f"reserve{lv+1}", i))
 
         # ⑤ 予約カード購入
         for i, card in enumerate(player.reserved):
@@ -187,6 +211,8 @@ class GameState:
     # 購入可能判定
     # =========================
     def can_buy(self, player, card):
+        if card is None:
+            return False
         for c in COLORS:
             required = card.cost[c] - player.bonuses[c]
             if required > player.tokens[c] + player.tokens[GOLD]:
@@ -217,8 +243,10 @@ class GameState:
             player.bonuses[card.bonus] += 1
             player.points += card.points
 
-            if self.decks:
+            if self.decks[lv+1]:
                 self.table[lv].append(self.decks[lv+1].pop())
+            else:
+                self.table[lv].append(None)  # デッキが空ならNoneを置く
         
         elif action_type == "buy_reserved":
             card = player.reserved.pop(value)
@@ -234,8 +262,10 @@ class GameState:
                 self.bank[GOLD] -= 1
                 player.tokens[GOLD] += 1
 
-            if self.decks:
+            if self.decks[lv+1]:
                 self.table[lv].append(self.decks[lv+1].pop())
+            else:
+                self.table[lv].append(None)  # デッキが空ならNoneを置く
         
         elif action_type == "pass":
             pass
@@ -265,3 +295,75 @@ class GameState:
             if required > 0 and player.tokens[GOLD] >= required:
                 player.tokens[GOLD] -= required
                 self.bank[GOLD] += required
+    
+def action_to_id(action):
+    action_type, value = action
+
+    # take3
+    if action_type == "take3":
+        combs = [tuple(sorted(c)) for c in combinations(COLORS, 3)]
+        return combs.index(tuple(sorted(value)))
+
+    offset = 10
+
+    # take2
+    if action_type == "take2":
+        return offset + COLORS.index(value)
+
+    offset += 5
+
+    # buy_table
+    if action_type.startswith("buy_table"):
+        lv = int(action_type[-1]) - 1
+        return offset + lv*4 + value
+
+    offset += 12
+
+    # reserve
+    if action_type.startswith("reserve"):
+        lv = int(action_type[-1]) - 1
+        return offset + lv*4 + value
+
+    offset += 12
+
+    # buy_reserved
+    if action_type == "buy_reserved":
+        return offset + value
+
+    offset += 3
+
+    # pass
+    return offset
+
+def state_to_vector(state):
+    vec = []
+
+    # ---- bank ----
+    vec += list(state.bank.values())
+
+    current = state.current_player
+    num_players = len(state.players)
+
+    # ---- プレイヤー情報をcurrent基準に並び替え ----
+    ordered_players = []
+
+    for i in range(num_players):
+        idx = (current + i) % num_players
+        ordered_players.append(state.players[idx])
+
+    for p in ordered_players:
+        vec += list(p.tokens.values())
+        vec += list(p.bonuses.values())
+        vec.append(p.points)
+
+    # ---- table ----
+    for lv in range(3):
+        for card in state.table[lv]:
+            if card is not None:
+                vec += list(card.cost.values())
+                vec.append(card.points)
+            else:
+                vec += [0]*5
+                vec.append(0)
+
+    return torch.tensor(vec, dtype=torch.float32)
