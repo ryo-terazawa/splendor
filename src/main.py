@@ -1,7 +1,9 @@
 from module import GameState
 import random
-from mcts import SplendorNet, self_play_train, StrongSplendorNet
-
+from mcts import MCTS, get_action_policy
+from mcts import StrongSplendorNet, generate_self_play_data, train_from_files, load_model
+from module import state_to_vector, action_to_id, ACTION_SIZE
+import numpy as np
 import torch
 
 def random_agent(state):
@@ -37,12 +39,11 @@ def human_agent(state, player_idx=None):
 
 
 def agent_action(state, model, device):
-    from module import state_to_vector, action_to_id, ACTION_SIZE
-    import numpy as np
     actions = state.get_legal_actions()
     state_vec = state_to_vector(state).unsqueeze(0).to(device)
     with torch.no_grad():
-        policy, _ = model(state_vec)
+        policy_logits, _ = model(state_vec)
+        policy = torch.softmax(policy_logits, dim=-1)        
     policy = policy.squeeze(0).cpu().numpy()
     # Mask illegal actions
     mask = np.zeros(ACTION_SIZE, dtype=np.float32)
@@ -59,6 +60,27 @@ def agent_action(state, model, device):
         if action_to_id(a) == action_id:
             return a
     return actions[0]
+
+# =========================
+# MCTS Agent
+# =========================
+def mcts_agent_action(state, model, device, num_simulations=100):
+
+    mcts = MCTS(model, device)
+
+    root = mcts.run(state, num_simulations)
+
+    policy = get_action_policy(root, ACTION_SIZE, temperature=0)
+
+    action_id = np.argmax(policy)
+
+    actions = state.get_legal_actions()
+
+    for a in actions:
+        if action_to_id(a) == action_id:
+            return a
+
+    return random.choice(actions)
 
 def get_player_type(idx):
     print(f"Configure Player {idx}:")
@@ -78,7 +100,6 @@ def get_player_type(idx):
             print("Invalid input.")
 
 def play_multi_player():
-    from mcts import StrongSplendorNet, load_model
     num_players = 0
     while num_players not in [2,3,4]:
         try:
@@ -109,8 +130,8 @@ def play_multi_player():
         if player_types[cur] == "human":
             action = human_agent(state, cur)
         elif player_types[cur] == "agent":
-            action = agent_action(state, player_models[cur], device)
-            print(f"Agent action: {action}")
+            action = mcts_agent_action(state, player_models[cur], device)
+            print(f"MCTS action: {action}")
         elif player_types[cur] == "random":
             action = random_agent(state)
             print(f"Random action: {action}")
@@ -133,16 +154,18 @@ def play_human_vs_agent(model, device):
         if state.current_player == 0:
             action = human_agent(state)
         else:
-            action = agent_action(state, model, device)
-            print(f"Agent action: {action}")
+            action = mcts_agent_action(state, model, device)
+            print(f"MCTS action: {action}")
         state.step(action)
     print("GAME OVER")
     for i, p in enumerate(state.players):
         print(f"Player {i}: points={p.points}")
     winner = max(range(len(state.players)), key=lambda i: state.players[i].points)
     print(f"Winner: Player {winner}")
-
-def play_game():
+# =========================
+# Random test game
+# =========================
+def random_test_game():
     state = GameState(num_players=2)
 
     turn = 0
@@ -157,20 +180,26 @@ def play_game():
     winner = max(range(len(state.players)), key=lambda i: state.players[i].points)
     print(f"Winner: Player {winner}")
 
-
+# =========================
+# main
+# =========================
 if __name__ == "__main__":
     print("Select mode:")
     print("1: Multi-player (2-4, human/agent/random selectable)")
     print("2: Random vs Random (test)")
     print("3: Self-play training (agent vs agent)")
+    print("4: make train data")
+    print("5: train model")
     mode = input("Enter mode number: ")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = StrongSplendorNet().to(device)
     if mode == "1":
         play_multi_player()
     elif mode == "2":
-        play_game()
+        random_test_game()
     elif mode == "3":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = StrongSplendorNet().to(device)
-        self_play_train(model, num_games=10, num_simulations=50, epochs=5, batch_size=32, lr=1e-3, device=device)
+        generate_self_play_data(model, num_games=100, num_simulations=50, device=device)
+    elif mode == "4":
+        train_from_files(model, data_dir="data/train", device=device)
     else:
         print("Invalid mode.")
