@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 
 ACTION_SIZE = 43
-STATE_SIZE = 102  # 実際の次元に合わせる
+STATE_SIZE = 102  # 実際の次元に合わせる(人数によって変化する)
 
 COLORS = ["white", "blue", "green", "red", "black"]
 GOLD = "gold"
@@ -77,21 +77,6 @@ class Player:
 # =========================
 class GameState:
 
-    def copy(self):
-        # GameStateのカスタムコピー（deepcopyより高速）
-        new_state = GameState(self.num_players)
-        # プレイヤー情報
-        new_state.players = [Player(tokens=p.tokens.copy(), bonuses=p.bonuses.copy(), points=p.points, reserved=list(p.reserved)) for p in self.players]
-        new_state.current_player = self.current_player
-        new_state.bank = self.bank.copy()
-        # デッキ・テーブル
-        new_state.decks = {lv: list(cards) for lv, cards in self.decks.items()}
-        new_state.table = [[card for card in row] for row in self.table]
-        # 貴族
-        new_state.nobility = list(self.nobility)
-        new_state.game_over = self.game_over
-        return new_state
-
     def __init__(self, num_players=4):
         self.num_players = num_players
         self.players = [Player() for _ in range(num_players)]
@@ -117,6 +102,37 @@ class GameState:
         
 
         self.game_over = False
+
+    def get_reward(self, player_idx=None):
+            """
+            (自分の点数 / 最大点数) を報酬として返す
+            """
+            if player_idx is None:
+                player_idx = self.current_player
+            my_point = self.players[player_idx].points
+            max_point = max(p.points for i, p in enumerate(self.players))
+            if max_point == 0:
+                return 0.0
+            return my_point / max_point
+
+    def clone(self):
+        # MCTS用
+        return self.copy()
+
+    def copy(self):
+        # GameStateのカスタムコピー（deepcopyより高速）
+        new_state = GameState(self.num_players)
+        # プレイヤー情報
+        new_state.players = [Player(tokens=p.tokens.copy(), bonuses=p.bonuses.copy(), points=p.points, reserved=list(p.reserved)) for p in self.players]
+        new_state.current_player = self.current_player
+        new_state.bank = self.bank.copy()
+        # デッキ・テーブル
+        new_state.decks = {lv: list(cards) for lv, cards in self.decks.items()}
+        new_state.table = [[card for card in row] for row in self.table]
+        # 貴族
+        new_state.nobility = list(self.nobility)
+        new_state.game_over = self.game_over
+        return new_state
 
     # =========================
     # デッキ生成
@@ -296,13 +312,14 @@ class GameState:
                 player.tokens[GOLD] -= required
                 self.bank[GOLD] += required
     
+COMBS_TAKE3 = [tuple(sorted(c)) for c in combinations(COLORS, 3)]
+
 def action_to_id(action):
     action_type, value = action
 
     # take3
     if action_type == "take3":
-        combs = [tuple(sorted(c)) for c in combinations(COLORS, 3)]
-        return combs.index(tuple(sorted(value)))
+        return COMBS_TAKE3.index(tuple(sorted(value)))
 
     offset = 10
 
